@@ -20,5 +20,12 @@ WScript.Sleep 3000
 
 ' Start PanDownload
 PanDownloadPath = CurrentDir & "\PanDownload\PanDownload.exe"
-WshShell.Run """" & PanDownloadPath & """", 1, False
+WshShell.Run """" & PanDownloadPath & """", 1, True
+
+Set svc = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\cimv2")
+For Each p In svc.ExecQuery("Select * from Win32_Process where Name='python.exe' or Name='pythonw.exe'")
+  If InStr(1, p.CommandLine, PythonScriptPath, vbTextCompare) > 0 Or InStr(1, p.CommandLine, "pdproxy_bypass.py", vbTextCompare) > 0 Then
+    p.Terminate()
+  End If
+Next
 
