@@ -1,12 +1,38 @@
 import http.server
 import socketserver
 import urllib.request
+import urllib.parse
+import ipaddress
 import socket
 import select
 import threading
 import sys
 
 PORT = 8888
+
+# Local fake-ip DNS answers every domain with an address in 198.18.0.0/15;
+# the real target is reached upstream when connecting to that address.
+_FAKE_IP_NET = ipaddress.ip_network('198.18.0.0/15')
+
+def _validate_forward_target(host):
+    """Anti-SSRF (CWE-918): resolve host and reject non-public targets.
+
+    Residual: the forwarding request performs its own DNS lookup, so a
+    TOCTOU rebinding window remains; accepted for a loopback-only demo
+    proxy (documented in the security report).
+    """
+    checked = 0
+    for info in socket.getaddrinfo(host, None):
+        ip = ipaddress.ip_address(info[4][0].split('%')[0])
+        checked += 1
+        if ip in _FAKE_IP_NET:
+            return
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+                or not ip.is_global):
+            raise ValueError(f"blocked non-public target: {host} -> {ip}")
+    if checked == 0:
+        raise ValueError(f"cannot resolve host: {host}")
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -46,6 +72,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Handle other requests (Forwarding)
         # Note: This is a simplified proxy. 
         # Ideally we should parse the URL properly.
+        # Anti-SSRF (CWE-918): only forward http/https to public targets.
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            self.send_error(403, "Forbidden: only http/https targets are allowed")
+            return
+        try:
+            _validate_forward_target(parsed.hostname)
+        except (ValueError, socket.gaierror) as e:
+            self.send_error(403, f"Forbidden: {e}")
+            return
+
         try:
             if method == 'GET':
                 req = urllib.request.Request(url)
@@ -74,9 +111,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         # Handle HTTPS Tunneling
         print(f"[CONNECT] {self.path}")
-        address = self.path.split(':')
-        host = address[0]
-        port = int(address[1]) if len(address) > 1 else 443
+        target = self.path
+        if target.startswith('['):
+            # IPv6 literal: [::1]:443
+            host = target[1:target.index(']')]
+            rest = target[target.index(']') + 1:]
+            port = int(rest[1:]) if rest.startswith(':') else 443
+        elif ':' in target:
+            host, _, port_s = target.rpartition(':')
+            if not host:
+                host = port_s
+            port = int(port_s) if port_s.isdigit() else 443
+        else:
+            host, port = target, 443
+
+        # Anti-SSRF (CWE-918): refuse tunneling to loopback/private/reserved.
+        try:
+            _validate_forward_target(host)
+        except (ValueError, socket.gaierror) as e:
+            self.send_error(403, f"Forbidden: {e}")
+            return
 
         # Direct tunnel for baidu domains - try to let them pass through
         # But since we can't modify headers inside SSL, this relies on PanDownload sending valid headers initially
